@@ -5,9 +5,9 @@ test_description='exercise basic bitmap functionality'
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-bitmap.sh
 
-# t5310 deals only with single-pack bitmaps, so don't write MIDX bitmaps in
-# their place.
-GIT_TEST_MULTI_PACK_INDEX_WRITE_BITMAP=0
+# Likewise, allow individual tests to control whether or not they use
+# the boundary-based traversal.
+sane_unset GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL
 
 objpath () {
 	echo ".git/objects/$(echo "$1" | sed -e 's|\(..\)|\1/|')"
@@ -25,6 +25,32 @@ list_packed_objects () {
 has_any () {
 	grep -Ff "$1" "$2"
 }
+
+# Since name-hash values are stored in the .bitmap files, add a test
+# that checks that the name-hash calculations are stable across versions.
+# Not exhaustive, but these hashing algorithms would be hard to change
+# without causing deviations here.
+test_expect_success 'name-hash value stability' '
+	cat >names <<-\EOF &&
+	first
+	second
+	third
+	one-long-enough-for-collisions
+	two-long-enough-for-collisions
+	EOF
+
+	test-tool name-hash <names >out &&
+
+	cat >expect <<-\EOF &&
+	2582249472	3109209818	first
+	2289942528	3781118409	second
+	2300837888	3028707182	third
+	2544516325	3241327563	one-long-enough-for-collisions
+	2544516325	4207880830	two-long-enough-for-collisions
+	EOF
+
+	test_cmp expect out
+'
 
 test_bitmap_cases () {
 	writeLookupTable=false
@@ -128,8 +154,9 @@ test_bitmap_cases () {
 		ls .git/objects/pack/ | grep bitmap >output &&
 		test_line_count = 1 output &&
 		# verify equivalent packs are generated with/without using bitmap index
-		packasha1=$(git pack-objects --no-use-bitmap-index --all packa </dev/null) &&
-		packbsha1=$(git pack-objects --use-bitmap-index --all packb </dev/null) &&
+		# Be careful to not use the path-walk option in either case.
+		packasha1=$(git pack-objects --no-use-bitmap-index --no-path-walk --all packa </dev/null) &&
+		packbsha1=$(git pack-objects --use-bitmap-index --no-path-walk --all packb </dev/null) &&
 		list_packed_objects packa-$packasha1.idx >packa.objects &&
 		list_packed_objects packb-$packbsha1.idx >packb.objects &&
 		test_cmp packa.objects packb.objects
@@ -267,7 +294,7 @@ test_bitmap_cases () {
 		mv -f $bitmap.tmp $bitmap &&
 		git rev-list --use-bitmap-index --count --all >actual 2>stderr &&
 		test_cmp expect actual &&
-		test_i18ngrep corrupt.ewah.bitmap stderr
+		test_grep corrupt.ewah.bitmap stderr
 	'
 
 	test_expect_success 'truncated bitmap fails gracefully (cache)' '
@@ -280,7 +307,7 @@ test_bitmap_cases () {
 		mv -f $bitmap.tmp $bitmap &&
 		git rev-list --use-bitmap-index --count --all >actual 2>stderr &&
 		test_cmp expect actual &&
-		test_i18ngrep corrupted.bitmap.index stderr
+		test_grep corrupted.bitmap.index stderr
 	'
 
 	# Create a state of history with these properties:
@@ -358,6 +385,14 @@ test_bitmap_cases () {
 		git init --bare client.git &&
 		(
 			cd client.git &&
+
+			# This test relies on reusing a delta, but if the
+			# path-walk machinery is engaged, the base object
+			# is considered too small to use during the
+			# dynamic computation, so is not used.
+			GIT_TEST_PACK_PATH_WALK=0 &&
+			export GIT_TEST_PACK_PATH_WALK &&
+
 			git config transfer.unpackLimit 1 &&
 			git fetch .. delta-reuse-old:delta-reuse-old &&
 			git fetch .. delta-reuse-new:delta-reuse-new &&
@@ -404,6 +439,26 @@ test_bitmap_cases () {
 		)
 	'
 
+	test_expect_success 'pack.preferBitmapTips' '
+		git init repo &&
+		test_when_finished "rm -rf repo" &&
+		(
+			cd repo &&
+			git config pack.writeBitmapLookupTable '"$writeLookupTable"' &&
+			test_commit_bulk --message="%s" 103 &&
+
+			cat >>.git/config <<-\EOF &&
+			[pack]
+				preferBitmapTips
+			EOF
+			cat >expect <<-\EOF &&
+			error: missing value for '\''pack.preferbitmaptips'\''
+			EOF
+			git repack -adb 2>actual &&
+			test_cmp expect actual
+		)
+	'
+
 	test_expect_success 'complains about multiple pack bitmaps' '
 		rm -fr repo &&
 		git init repo &&
@@ -428,23 +483,70 @@ test_bitmap_cases () {
 			test_line_count = 2 packs &&
 			test_line_count = 2 bitmaps &&
 
-			git rev-list --use-bitmap-index HEAD 2>err &&
-			grep "ignoring extra bitmap file" err
+			GIT_TRACE2_EVENT=$(pwd)/trace2.txt git rev-list --use-bitmap-index HEAD &&
+			grep "opened bitmap" trace2.txt &&
+			grep "ignoring extra bitmap" trace2.txt
 		)
 	'
 }
 
 test_bitmap_cases
 
+GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL=1
+export GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL
+
+test_bitmap_cases
+
+sane_unset GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL
+
 test_expect_success 'incremental repack fails when bitmaps are requested' '
 	test_commit more-1 &&
 	test_must_fail git repack -d 2>err &&
-	test_i18ngrep "Incremental repacks are incompatible with bitmap" err
+	test_grep "Incremental repacks are incompatible with bitmap" err
 '
 
 test_expect_success 'incremental repack can disable bitmaps' '
 	test_commit more-2 &&
 	git repack -d --no-write-bitmap-index
+'
+
+test_expect_success 'boundary-based traversal is used when requested' '
+	git repack -a -d --write-bitmap-index &&
+
+	for argv in \
+		"git -c pack.useBitmapBoundaryTraversal=true" \
+		"git -c feature.experimental=true" \
+		"GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL=1 git"
+	do
+		eval "GIT_TRACE2_EVENT=1 $argv rev-list --objects \
+			--use-bitmap-index second..other 2>perf" &&
+		grep "\"region_enter\".*\"label\":\"haves/boundary\"" perf ||
+			return 1
+	done &&
+
+	for argv in \
+		"git -c pack.useBitmapBoundaryTraversal=false" \
+		"git -c feature.experimental=true -c pack.useBitmapBoundaryTraversal=false" \
+		"GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL=0 git -c pack.useBitmapBoundaryTraversal=true" \
+		"GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL=0 git -c feature.experimental=true"
+	do
+		eval "GIT_TRACE2_EVENT=1 $argv rev-list --objects \
+			--use-bitmap-index second..other 2>perf" &&
+		grep "\"region_enter\".*\"label\":\"haves/classic\"" perf ||
+			return 1
+	done
+'
+
+test_expect_success 'left-right not confused by bitmap index' '
+	git rev-list --left-right other...HEAD >expect &&
+	git rev-list --use-bitmap-index --left-right other...HEAD >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'left-right count not confused by bitmap-index' '
+	git rev-list --left-right --count other...HEAD >expect &&
+	git rev-list --use-bitmap-index --left-right --count other...HEAD >actual &&
+	test_cmp expect actual
 '
 
 test_bitmap_cases "pack.writeBitmapLookupTable"
@@ -465,7 +567,7 @@ test_expect_success 'truncated bitmap fails gracefully (lookup table)' '
 	mv -f $bitmap.tmp $bitmap &&
 	git rev-list --use-bitmap-index --count --all >actual 2>stderr &&
 	test_cmp expect actual &&
-	test_i18ngrep corrupted.bitmap.index stderr
+	test_grep corrupted.bitmap.index stderr
 '
 
 test_done

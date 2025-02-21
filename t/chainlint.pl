@@ -9,9 +9,9 @@
 # Input arguments are pathnames of shell scripts containing test definitions,
 # or globs referencing a collection of scripts. For each problem discovered,
 # the pathname of the script containing the test is printed along with the test
-# name and the test body with a `?!FOO?!` annotation at the location of each
-# detected problem, where "FOO" is a tag such as "AMP" which indicates a broken
-# &&-chain. Returns zero if no problems are discovered, otherwise non-zero.
+# name and the test body with a `?!LINT: ...?!` annotation at the location of
+# each detected problem, where "..." is an explanation of the problem. Returns
+# zero if no problems are discovered, otherwise non-zero.
 
 use warnings;
 use strict;
@@ -67,6 +67,7 @@ sub new {
 	bless {
 		parser => $parser,
 		buff => $s,
+		lineno => 1,
 		heretags => []
 	} => $class;
 }
@@ -75,9 +76,12 @@ sub scan_heredoc_tag {
 	my $self = shift @_;
 	${$self->{buff}} =~ /\G(-?)/gc;
 	my $indented = $1;
-	my $tag = $self->scan_token();
+	my $token = $self->scan_token();
+	return "<<$indented" unless $token;
+	my $tag = $token->[0];
 	$tag =~ s/['"\\]//g;
-	push(@{$self->{heretags}}, $indented ? "\t$tag" : "$tag");
+	$$token[0] = $indented ? "\t$tag" : "$tag";
+	push(@{$self->{heretags}}, $token);
 	return "<<$indented$tag";
 }
 
@@ -95,7 +99,9 @@ sub scan_op {
 sub scan_sqstring {
 	my $self = shift @_;
 	${$self->{buff}} =~ /\G([^']*'|.*\z)/sgc;
-	return "'" . $1;
+	my $s = $1;
+	$self->{lineno} += () = $s =~ /\n/sg;
+	return "'" . $s;
 }
 
 sub scan_dqstring {
@@ -113,7 +119,7 @@ sub scan_dqstring {
 		if ($c eq '\\') {
 			$s .= '\\', last unless $$b =~ /\G(.)/sgc;
 			$c = $1;
-			next if $c eq "\n"; # line splice
+			$self->{lineno}++, next if $c eq "\n"; # line splice
 			# backslash escapes only $, `, ", \ in dq-string
 			$s .= '\\' unless $c =~ /^[\$`"\\]$/;
 			$s .= $c;
@@ -121,6 +127,7 @@ sub scan_dqstring {
 		}
 		die("internal error scanning dq-string '$c'\n");
 	}
+	$self->{lineno} += () = $s =~ /\n/sg;
 	return $s;
 }
 
@@ -135,6 +142,7 @@ sub scan_balanced {
 		$depth--;
 		last if $depth == 0;
 	}
+	$self->{lineno} += () = $s =~ /\n/sg;
 	return $s;
 }
 
@@ -149,7 +157,7 @@ sub scan_dollar {
 	my $self = shift @_;
 	my $b = $self->{buff};
 	return $self->scan_balanced('(', ')') if $$b =~ /\G\((?=\()/gc; # $((...))
-	return '(' . join(' ', $self->scan_subst()) . ')' if $$b =~ /\G\(/gc; # $(...)
+	return '(' . join(' ', map {$_->[0]} $self->scan_subst()) . ')' if $$b =~ /\G\(/gc; # $(...)
 	return $self->scan_balanced('{', '}') if $$b =~ /\G\{/gc; # ${...}
 	return $1 if $$b =~ /\G(\w+)/gc; # $var
 	return $1 if $$b =~ /\G([@*#?$!0-9-])/gc; # $*, $1, $$, etc.
@@ -161,8 +169,23 @@ sub swallow_heredocs {
 	my $b = $self->{buff};
 	my $tags = $self->{heretags};
 	while (my $tag = shift @$tags) {
-		my $indent = $tag =~ s/^\t// ? '\\s*' : '';
-		$$b =~ /(?:\G|\n)$indent\Q$tag\E(?:\n|\z)/gc;
+		my $start = pos($$b);
+		my $indent = $$tag[0] =~ s/^\t// ? '\\s*' : '';
+		$$b =~ /(?:\G|\n)$indent\Q$$tag[0]\E(?:\n|\z)/gc;
+		if (pos($$b) > $start) {
+			my $body = substr($$b, $start, pos($$b) - $start);
+			$self->{parser}->{heredocs}->{$$tag[0]} = {
+				content => substr($body, 0, length($body) - length($&)),
+				start_line => $self->{lineno},
+		        };
+			$self->{lineno} += () = $body =~ /\n/sg;
+			next;
+		}
+		push(@{$self->{parser}->{problems}}, ['HEREDOC', $tag]);
+		$$b =~ /(?:\G|\n).*\z/gc; # consume rest of input
+		my $body = substr($$b, $start, pos($$b) - $start);
+		$self->{lineno} += () = $body =~ /\n/sg;
+		last;
 	}
 }
 
@@ -170,34 +193,37 @@ sub scan_token {
 	my $self = shift @_;
 	my $b = $self->{buff};
 	my $token = '';
+	my ($start, $startln);
 RESTART:
+	$startln = $self->{lineno};
 	$$b =~ /\G[ \t]+/gc; # skip whitespace (but not newline)
-	return "\n" if $$b =~ /\G#[^\n]*(?:\n|\z)/gc; # comment
+	$start = pos($$b) || 0;
+	$self->{lineno}++, return ["\n", $start, pos($$b), $startln, $startln] if $$b =~ /\G#[^\n]*(?:\n|\z)/gc; # comment
 	while (1) {
 		# slurp up non-special characters
 		$token .= $1 if $$b =~ /\G([^\\;&|<>(){}'"\$\s]+)/gc;
 		# handle special characters
 		last unless $$b =~ /\G(.)/sgc;
 		my $c = $1;
-		last if $c =~ /^[ \t]$/; # whitespace ends token
+		pos($$b)--, last if $c =~ /^[ \t]$/; # whitespace ends token
 		pos($$b)--, last if length($token) && $c =~ /^[;&|<>(){}\n]$/;
 		$token .= $self->scan_sqstring(), next if $c eq "'";
 		$token .= $self->scan_dqstring(), next if $c eq '"';
 		$token .= $c . $self->scan_dollar(), next if $c eq '$';
-		$self->swallow_heredocs(), $token = $c, last if $c eq "\n";
+		$self->{lineno}++, $self->swallow_heredocs(), $token = $c, last if $c eq "\n";
 		$token = $self->scan_op($c), last if $c =~ /^[;&|<>]$/;
 		$token = $c, last if $c =~ /^[(){}]$/;
 		if ($c eq '\\') {
 			$token .= '\\', last unless $$b =~ /\G(.)/sgc;
 			$c = $1;
-			next if $c eq "\n" && length($token); # line splice
-			goto RESTART if $c eq "\n"; # line splice
+			$self->{lineno}++, next if $c eq "\n" && length($token); # line splice
+			$self->{lineno}++, goto RESTART if $c eq "\n"; # line splice
 			$token .= '\\' . $c;
 			next;
 		}
 		die("internal error scanning character '$c'\n");
 	}
-	return length($token) ? $token : undef;
+	return length($token) ? [$token, $start, pos($$b), $startln, $self->{lineno}] : undef;
 }
 
 # ShellParser parses POSIX shell scripts (with minor extensions for Bash). It
@@ -210,7 +236,9 @@ sub new {
 	my $self = bless {
 		buff => [],
 		stop => [],
-		output => []
+		output => [],
+		heredocs => {},
+		insubshell => 0,
 	} => $class;
 	$self->{lexer} = Lexer->new($self, $s);
 	return $self;
@@ -239,14 +267,14 @@ sub stop_at {
 	my ($self, $token) = @_;
 	return 1 unless defined($token);
 	my $stop = ${$self->{stop}}[-1] if @{$self->{stop}};
-	return defined($stop) && $token =~ $stop;
+	return defined($stop) && $token->[0] =~ $stop;
 }
 
 sub expect {
 	my ($self, $expect) = @_;
 	my $token = $self->next_token();
-	return $token if defined($token) && $token eq $expect;
-	push(@{$self->{output}}, "?!ERR?! expected '$expect' but found '" . (defined($token) ? $token : "<end-of-input>") . "'\n");
+	return $token if defined($token) && $token->[0] eq $expect;
+	push(@{$self->{output}}, "?!ERR?! expected '$expect' but found '" . (defined($token) ? $token->[0] : "<end-of-input>") . "'\n");
 	$self->untoken($token) if defined($token);
 	return ();
 }
@@ -255,7 +283,7 @@ sub optional_newlines {
 	my $self = shift @_;
 	my @tokens;
 	while (my $token = $self->peek()) {
-		last unless $token eq "\n";
+		last unless $token->[0] eq "\n";
 		push(@tokens, $self->next_token());
 	}
 	return @tokens;
@@ -269,8 +297,11 @@ sub parse_group {
 
 sub parse_subshell {
 	my $self = shift @_;
-	return ($self->parse(qr/^\)$/),
-		$self->expect(')'));
+	$self->{insubshell}++;
+	my @tokens = ($self->parse(qr/^\)$/),
+		      $self->expect(')'));
+	$self->{insubshell}--;
+	return @tokens;
 }
 
 sub parse_case_pattern {
@@ -278,7 +309,7 @@ sub parse_case_pattern {
 	my @tokens;
 	while (defined(my $token = $self->next_token())) {
 		push(@tokens, $token);
-		last if $token eq ')';
+		last if $token->[0] eq ')';
 	}
 	return @tokens;
 }
@@ -293,13 +324,13 @@ sub parse_case {
 	     $self->optional_newlines());
 	while (1) {
 		my $token = $self->peek();
-		last unless defined($token) && $token ne 'esac';
+		last unless defined($token) && $token->[0] ne 'esac';
 		push(@tokens,
 		     $self->parse_case_pattern(),
 		     $self->optional_newlines(),
 		     $self->parse(qr/^(?:;;|esac)$/)); # item body
 		$token = $self->peek();
-		last unless defined($token) && $token ne 'esac';
+		last unless defined($token) && $token->[0] ne 'esac';
 		push(@tokens,
 		     $self->expect(';;'),
 		     $self->optional_newlines());
@@ -315,7 +346,7 @@ sub parse_for {
 	     $self->next_token(), # variable
 	     $self->optional_newlines());
 	my $token = $self->peek();
-	if (defined($token) && $token eq 'in') {
+	if (defined($token) && $token->[0] eq 'in') {
 		push(@tokens,
 		     $self->expect('in'),
 		     $self->optional_newlines());
@@ -339,11 +370,11 @@ sub parse_if {
 		     $self->optional_newlines(),
 		     $self->parse(qr/^(?:elif|else|fi)$/)); # if/elif body
 		my $token = $self->peek();
-		last unless defined($token) && $token eq 'elif';
+		last unless defined($token) && $token->[0] eq 'elif';
 		push(@tokens, $self->expect('elif'));
 	}
 	my $token = $self->peek();
-	if (defined($token) && $token eq 'else') {
+	if (defined($token) && $token->[0] eq 'else') {
 		push(@tokens,
 		     $self->expect('else'),
 		     $self->optional_newlines(),
@@ -380,7 +411,7 @@ sub parse_bash_array_assignment {
 	my @tokens = $self->expect('(');
 	while (defined(my $token = $self->next_token())) {
 		push(@tokens, $token);
-		last if $token eq ')';
+		last if $token->[0] eq ')';
 	}
 	return @tokens;
 }
@@ -398,29 +429,31 @@ sub parse_cmd {
 	my $self = shift @_;
 	my $cmd = $self->next_token();
 	return () unless defined($cmd);
-	return $cmd if $cmd eq "\n";
+	return $cmd if $cmd->[0] eq "\n";
 
 	my $token;
 	my @tokens = $cmd;
-	if ($cmd eq '!') {
+	if ($cmd->[0] eq '!') {
 		push(@tokens, $self->parse_cmd());
 		return @tokens;
-	} elsif (my $f = $compound{$cmd}) {
+	} elsif (my $f = $compound{$cmd->[0]}) {
 		push(@tokens, $self->$f());
-	} elsif (defined($token = $self->peek()) && $token eq '(') {
-		if ($cmd !~ /\w=$/) {
+	} elsif (defined($token = $self->peek()) && $token->[0] eq '(') {
+		if ($cmd->[0] !~ /\w=$/) {
 			push(@tokens, $self->parse_func());
 			return @tokens;
 		}
-		$tokens[-1] .= join(' ', $self->parse_bash_array_assignment());
+		my @array = $self->parse_bash_array_assignment();
+		$tokens[-1]->[0] .= join(' ', map {$_->[0]} @array);
+		$tokens[-1]->[2] = $array[$#array][2] if @array;
 	}
 
 	while (defined(my $token = $self->next_token())) {
 		$self->untoken($token), last if $self->stop_at($token);
 		push(@tokens, $token);
-		last if $token =~ /^(?:[;&\n|]|&&|\|\|)$/;
+		last if $token->[0] =~ /^(?:[;&\n|]|&&|\|\|)$/;
 	}
-	push(@tokens, $self->next_token()) if $tokens[-1] ne "\n" && defined($token = $self->peek()) && $token eq "\n";
+	push(@tokens, $self->next_token()) if $tokens[-1]->[0] ne "\n" && defined($token = $self->peek()) && $token->[0] eq "\n";
 	return @tokens;
 }
 
@@ -453,11 +486,18 @@ package TestParser;
 
 use base 'ShellParser';
 
+sub new {
+	my $class = shift @_;
+	my $self = $class->SUPER::new(@_);
+	$self->{problems} = [];
+	return $self;
+}
+
 sub find_non_nl {
 	my $tokens = shift @_;
 	my $n = shift @_;
 	$n = $#$tokens if !defined($n);
-	$n-- while $n >= 0 && $$tokens[$n] eq "\n";
+	$n-- while $n >= 0 && $$tokens[$n]->[0] eq "\n";
 	return $n;
 }
 
@@ -467,7 +507,7 @@ sub ends_with {
 	for my $needle (reverse(@$needles)) {
 		return undef if $n < 0;
 		$n = find_non_nl($tokens, $n), next if $needle eq "\n";
-		return undef if $$tokens[$n] !~ $needle;
+		return undef if $$tokens[$n]->[0] !~ $needle;
 		$n--;
 	}
 	return 1;
@@ -486,13 +526,13 @@ sub parse_loop_body {
 	my $self = shift @_;
 	my @tokens = $self->SUPER::parse_loop_body(@_);
 	# did loop signal failure via "|| return" or "|| exit"?
-	return @tokens if !@tokens || grep(/^(?:return|exit|\$\?)$/, @tokens);
+	return @tokens if !@tokens || grep {$_->[0] =~ /^(?:return|exit|\$\?)$/} @tokens;
 	# did loop upstream of a pipe signal failure via "|| echo 'impossible
 	# text'" as the final command in the loop body?
 	return @tokens if ends_with(\@tokens, [qr/^\|\|$/, "\n", qr/^echo$/, qr/^.+$/]);
 	# flag missing "return/exit" handling explicit failure in loop body
 	my $n = find_non_nl(\@tokens);
-	splice(@tokens, $n + 1, 0, '?!LOOP?!');
+	push(@{$self->{problems}}, [$self->{insubshell} ? 'LOOPEXIT' : 'LOOPRETURN', $tokens[$n]]);
 	return @tokens;
 }
 
@@ -505,8 +545,13 @@ my @safe_endings = (
 
 sub accumulate {
 	my ($self, $tokens, $cmd) = @_;
+	my $problems = $self->{problems};
+
+	# no previous command to check for missing "&&"
 	goto DONE unless @$tokens;
-	goto DONE if @$cmd == 1 && $$cmd[0] eq "\n";
+
+	# new command is empty line; can't yet check if previous is missing "&&"
+	goto DONE if @$cmd == 1 && $$cmd[0]->[0] eq "\n";
 
 	# did previous command end with "&&", "|", "|| return" or similar?
 	goto DONE if match_ending($tokens, \@safe_endings);
@@ -514,20 +559,20 @@ sub accumulate {
 	# if this command handles "$?" specially, then okay for previous
 	# command to be missing "&&"
 	for my $token (@$cmd) {
-		goto DONE if $token =~ /\$\?/;
+		goto DONE if $token->[0] =~ /\$\?/;
 	}
 
 	# if this command is "false", "return 1", or "exit 1" (which signal
 	# failure explicitly), then okay for all preceding commands to be
 	# missing "&&"
-	if ($$cmd[0] =~ /^(?:false|return|exit)$/) {
-		@$tokens = grep(!/^\?!AMP\?!$/, @$tokens);
+	if ($$cmd[0]->[0] =~ /^(?:false|return|exit)$/) {
+		@$problems = grep {$_->[0] ne 'AMP'} @$problems;
 		goto DONE;
 	}
 
 	# flag missing "&&" at end of previous command
 	my $n = find_non_nl($tokens);
-	splice(@$tokens, $n + 1, 0, '?!AMP?!') unless $n < 0;
+	push(@$problems, ['AMP', $tokens->[$n]]) unless $n < 0;
 
 DONE:
 	$self->SUPER::accumulate($tokens, $cmd);
@@ -546,6 +591,7 @@ sub new {
 	my $class = shift @_;
 	my $self = $class->SUPER::new(@_);
 	$self->{ntests} = 0;
+	$self->{nerrs} = 0;
 	return $self;
 }
 
@@ -553,7 +599,7 @@ sub new {
 # composition of multiple strings and non-string character runs; for instance,
 # `"test body"` unwraps to `test body`; `word"a b"42'c d'` to `worda b42c d`
 sub unwrap {
-	my $token = @_ ? shift @_ : $_;
+	my $token = (@_ ? shift @_ : $_)->[0];
 	# simple case: 'sqstring' or "dqstring"
 	return $token if $token =~ s/^'([^']*)'$/$1/;
 	return $token if $token =~ s/^"([^"]*)"$/$1/;
@@ -578,19 +624,51 @@ sub unwrap {
 	return $s
 }
 
+sub format_problem {
+	local $_ = shift;
+	/^AMP$/ && return "missing '&&'";
+	/^LOOPRETURN$/ && return "missing '|| return 1'";
+	/^LOOPEXIT$/ && return "missing '|| exit 1'";
+	/^HEREDOC$/ && return 'unclosed heredoc';
+	die("unrecognized problem type '$_'\n");
+}
+
 sub check_test {
 	my $self = shift @_;
-	my ($title, $body) = map(unwrap, @_);
+	my $title = unwrap(shift @_);
+	my $body = shift @_;
+	my $lineno = $body->[3];
+	$body = unwrap($body);
+	if ($body eq '-') {
+		my $herebody = shift @_;
+		$body = $herebody->{content};
+		$lineno = $herebody->{start_line};
+	}
 	$self->{ntests}++;
 	my $parser = TestParser->new(\$body);
 	my @tokens = $parser->parse();
-	return unless $emit_all || grep(/\?![^?]+\?!/, @tokens);
+	my $problems = $parser->{problems};
+	$self->{nerrs} += @$problems;
+	return unless $emit_all || @$problems;
 	my $c = main::fd_colors(1);
-	my $checked = join(' ', @tokens);
-	$checked =~ s/^\n//;
-	$checked =~ s/^ //mg;
-	$checked =~ s/ $//mg;
-	$checked =~ s/(\?![^?]+\?!)/$c->{rev}$c->{red}$1$c->{reset}/mg;
+	my ($erropen, $errclose) = -t 1 ? ("$c->{rev}$c->{red}", $c->{reset}) : ('?!', '?!');
+	my $start = 0;
+	my $checked = '';
+	for (sort {$a->[1]->[2] <=> $b->[1]->[2]} @$problems) {
+		my ($label, $token) = @$_;
+		my $pos = $token->[2];
+		my $err = format_problem($label);
+		$checked .= substr($body, $start, $pos - $start);
+		$checked .= ' ' unless $checked =~ /\s$/;
+		$checked .= "${erropen}LINT: $err$errclose";
+		$checked .= ' ' unless $pos >= length($body) ||
+		    substr($body, $pos, 1) =~ /^\s/;
+		$start = $pos;
+	}
+	$checked .= substr($body, $start);
+	$checked =~ s/^/$lineno++ . ' '/mge;
+	$checked =~ s/^\d+ \n//;
+	$checked =~ s/^\d+/$c->{dim}$&$c->{reset}/mg;
 	$checked .= "\n" unless $checked =~ /\n$/;
 	push(@{$self->{output}}, "$c->{blue}# chainlint: $title$c->{reset}\n$checked");
 }
@@ -598,11 +676,16 @@ sub check_test {
 sub parse_cmd {
 	my $self = shift @_;
 	my @tokens = $self->SUPER::parse_cmd();
-	return @tokens unless @tokens && $tokens[0] =~ /^test_expect_(?:success|failure)$/;
+	return @tokens unless @tokens && $tokens[0]->[0] =~ /^test_expect_(?:success|failure)$/;
 	my $n = $#tokens;
-	$n-- while $n >= 0 && $tokens[$n] =~ /^(?:[;&\n|]|&&|\|\|)$/;
-	$self->check_test($tokens[1], $tokens[2]) if $n == 2; # title body
-	$self->check_test($tokens[2], $tokens[3]) if $n > 2;  # prereq title body
+	$n-- while $n >= 0 && $tokens[$n]->[0] =~ /^(?:[;&\n|]|&&|\|\|)$/;
+	my $herebody;
+	if ($n >= 2 && $tokens[$n-1]->[0] eq '-' && $tokens[$n]->[0] =~ /^<<-?(.+)$/) {
+		$herebody = $self->{heredocs}->{$1};
+		$n--;
+	}
+	$self->check_test($tokens[1], $tokens[2], $herebody) if $n == 2; # title body
+	$self->check_test($tokens[2], $tokens[3], $herebody) if $n > 2;  # prereq title body
 	return @tokens;
 }
 
@@ -622,25 +705,39 @@ if (eval {require Time::HiRes; Time::HiRes->import(); 1;}) {
 # thread and ignore %ENV changes in subthreads.
 $ENV{TERM} = $ENV{USER_TERM} if $ENV{USER_TERM};
 
-my @NOCOLORS = (bold => '', rev => '', reset => '', blue => '', green => '', red => '');
+my @NOCOLORS = (bold => '', rev => '', dim => '', reset => '', blue => '', green => '', red => '');
 my %COLORS = ();
 sub get_colors {
 	return \%COLORS if %COLORS;
-	if (exists($ENV{NO_COLOR}) ||
-	    system("tput sgr0 >/dev/null 2>&1") != 0 ||
-	    system("tput bold >/dev/null 2>&1") != 0 ||
-	    system("tput rev  >/dev/null 2>&1") != 0 ||
-	    system("tput setaf 1 >/dev/null 2>&1") != 0) {
+	if (exists($ENV{NO_COLOR})) {
 		%COLORS = @NOCOLORS;
 		return \%COLORS;
 	}
-	%COLORS = (bold  => `tput bold`,
-		   rev   => `tput rev`,
-		   reset => `tput sgr0`,
-		   blue  => `tput setaf 4`,
-		   green => `tput setaf 2`,
-		   red   => `tput setaf 1`);
-	chomp(%COLORS);
+	if ($ENV{TERM} =~ /xterm|xterm-\d+color|xterm-new|xterm-direct|nsterm|nsterm-\d+color|nsterm-direct/) {
+		%COLORS = (bold  => "\e[1m",
+			   rev   => "\e[7m",
+			   dim   => "\e[2m",
+			   reset => "\e[0m",
+			   blue  => "\e[34m",
+			   green => "\e[32m",
+			   red   => "\e[31m");
+		return \%COLORS;
+	}
+	if (system("tput sgr0 >/dev/null 2>&1") == 0 &&
+	    system("tput bold >/dev/null 2>&1") == 0 &&
+	    system("tput rev  >/dev/null 2>&1") == 0 &&
+	    system("tput dim  >/dev/null 2>&1") == 0 &&
+	    system("tput setaf 1 >/dev/null 2>&1") == 0) {
+		%COLORS = (bold  => `tput bold`,
+			   rev   => `tput rev`,
+			   dim   => `tput dim`,
+			   reset => `tput sgr0`,
+			   blue  => `tput setaf 4`,
+			   green => `tput setaf 2`,
+			   red   => `tput setaf 1`);
+		return \%COLORS;
+	}
+	%COLORS = @NOCOLORS;
 	return \%COLORS;
 }
 
@@ -654,11 +751,25 @@ sub fd_colors {
 
 sub ncores {
 	# Windows
-	return $ENV{NUMBER_OF_PROCESSORS} if exists($ENV{NUMBER_OF_PROCESSORS});
+	if (exists($ENV{NUMBER_OF_PROCESSORS})) {
+		my $ncpu = $ENV{NUMBER_OF_PROCESSORS};
+		return $ncpu > 0 ? $ncpu : 1;
+	}
 	# Linux / MSYS2 / Cygwin / WSL
-	do { local @ARGV='/proc/cpuinfo'; return scalar(grep(/^processor\s*:/, <>)); } if -r '/proc/cpuinfo';
+	if (open my $fh, '<', '/proc/cpuinfo') {
+		my $cpuinfo = do { local $/; <$fh> };
+		close($fh);
+		if ($cpuinfo =~ /^n?cpus active\s*:\s*(\d+)/m) {
+			return $1 if $1 > 0;
+		}
+		my @matches = ($cpuinfo =~ /^(processor|CPU)[\s\d]*:/mg);
+		return @matches ? scalar(@matches) : 1;
+	}
 	# macOS & BSD
-	return qx/sysctl -n hw.ncpu/ if $^O =~ /(?:^darwin$|bsd)/;
+	if ($^O =~ /(?:^darwin$|bsd)/) {
+		my $ncpu = qx/sysctl -n hw.ncpu/;
+		return $ncpu > 0 ? $ncpu : 1;
+	}
 	return 1;
 }
 
@@ -686,7 +797,7 @@ sub check_script {
 	while (my $path = $next_script->()) {
 		$nscripts++;
 		my $fh;
-		unless (open($fh, "<", $path)) {
+		unless (open($fh, "<:unix:crlf", $path)) {
 			$emit->("?!ERR?! $path: $!\n");
 			next;
 		}
@@ -698,9 +809,9 @@ sub check_script {
 			my $c = fd_colors(1);
 			my $s = join('', @{$parser->{output}});
 			$emit->("$c->{bold}$c->{blue}# chainlint: $path$c->{reset}\n" . $s);
-			$nerrs += () = $s =~ /\?![^?]+\?!/g;
 		}
 		$ntests += $parser->{ntests};
+		$nerrs += $parser->{nerrs};
 	}
 	return [$id, $nscripts, $ntests, $nerrs];
 }
@@ -730,8 +841,10 @@ unless (@scripts) {
 	show_stats($start_time, \@stats) if $show_stats;
 	exit;
 }
+$jobs = @scripts if @scripts < $jobs;
 
-unless ($Config{useithreads} && eval {
+unless ($jobs > 1 &&
+	$Config{useithreads} && eval {
 	require threads; threads->import();
 	require Thread::Queue; Thread::Queue->import();
 	1;
